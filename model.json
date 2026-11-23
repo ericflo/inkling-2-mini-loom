@@ -1,0 +1,83 @@
+{
+ "schema_version": 1,
+ "model": {
+  "id": "Inkling-2-Mini",
+  "name": "Inkling-2-Mini (Official NVFP4 + Q8_0 on AMD Loom)"
+ },
+ "programs": {
+  "source": {
+   "inputs": [
+    {
+     "path": "program/prepare.loom",
+     "data": [
+      "weights.loom",
+      "head_weights.loom",
+      "llm_config.json"
+     ]
+    },
+    "program/control.loom",
+    "program/storage.loom",
+    "program/service.loom"
+   ],
+   "libraries": [
+    "program/llm.loom"
+   ]
+  }
+ },
+ "services": {
+  "chat": {
+   "kind": "text",
+   "version": 1
+  }
+ },
+ "variants": {
+  "gguf": {
+   "services": {
+    "chat": {
+     "programs": [
+      "source"
+     ],
+     "config": {
+      "llm.card": true,
+      "llm.logits": false
+     },
+     "parameters": {
+      "model": {
+       "files": [
+        {
+         "path": "weights/Inkling-2-Mini-official-nvfp4-q8.gguf",
+         "format": "gguf"
+        }
+       ]
+      },
+      "draft": {
+       "files": [
+        {
+         "path": "weights/dspark-Inkling-2-Mini-official-q8.gguf",
+         "format": "gguf"
+        }
+       ]
+      }
+     },
+     "tokenizers": {
+      "text": "weights/tokenizer.json"
+     }
+    }
+   }
+  }
+ },
+ "presets": {
+  "chat": {
+   "service": "chat",
+   "variant": "gguf",
+   "programs": "source",
+   "execution": {
+    "rows": 4,
+    "context_capacity": 262144,
+    "prefill_capacity": 4096,
+    "max_tokens": 4096,
+    "draft_depth": 3
+   }
+  }
+ }
+}

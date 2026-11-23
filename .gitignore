@@ -1,0 +1,23 @@
+# Large model weights, compiled artifacts, caches, and environments
+models/
+weights/
+.hf_cache/
+.venv/
+.loom_cache/
+reference/
+build/
+tmp/
+*.safetensors
+*.gguf
+*.gguf_file
+*.bin
+*.pt
+*.pth
+*.vmfb
+*.so
+*.o
+*.a
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
