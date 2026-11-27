@@ -1,7 +1,7 @@
 {
  "schema_version": 1,
  "model": {
-  "id": "Inkling-2-Mini",
+  "id": "inkling-2-mini-loom",
   "name": "Inkling-2-Mini (Official NVFP4 + Q8_0 on AMD Loom)"
  },
  "programs": {
