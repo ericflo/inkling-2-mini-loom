@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run official thinkingmachines/Inkling-2-Mini (NVFP4 + Q8_0 + DSpark) on AMD Loom (Strix Halo gfx1151).
+# Serve text and image chat with Inkling-2-Mini (NVFP4 + Q8_0 + DSpark) on AMD Loom.
 #
 # Usage:
 #   ./run.sh                         # Start on 127.0.0.1:18422 (262k context, adaptive DSpark d1<->d3)
@@ -14,11 +14,12 @@ set -euo pipefail
 # Endpoints once ready:
 #   OpenAI Chat API:  http://$HOST:$PORT/v1/chat/completions
 #   Model status:     http://$HOST:$PORT/v1/status
+#   Capabilities:     http://$HOST:$PORT/v1/models
 #   Live dashboard:   http://$HOST:$PORT/dashboard/
 #   Metrics:          http://$HOST:$PORT/metrics
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,/^$/p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 fi
 
@@ -50,6 +51,14 @@ for f in \
   fi
 done
 
+if [[ ! -f "weights/mmproj-Inkling-2-Mini-official-f16.gguf" ]]; then
+  if [[ ! -f "models/Inkling-2-Mini/model-00001-of-00001.safetensors" ]]; then
+    echo "ERROR: Vision weights are missing. Run ./setup.sh to build the image projector." >&2
+    exit 1
+  fi
+  .venv/bin/python scripts/convert_official.py --only-missing
+fi
+
 mkdir -p "$SCRIPT_DIR/.loom_cache"
 export XDG_CACHE_HOME="$SCRIPT_DIR/.loom_cache"
 
@@ -72,7 +81,7 @@ if [[ "$CONTEXT_CAPACITY" != "262144" || "$DRAFT_DEPTH" != "3" || "$ROWS" != "4"
 EOF
 fi
 
-echo "==> Starting AMD Loom server for Inkling-2-Mini (official NVFP4 + Q8_0)"
+echo "==> Starting AMD Loom server for Inkling-2-Mini (text and image input, official NVFP4 + Q8_0)"
 echo "    Listen:      http://$HOST:$PORT"
 echo "    Dashboard:   http://$HOST:$PORT/dashboard/"
 echo "    Device:      $DEVICE"

@@ -214,3 +214,4 @@ inkling-2-mini-loom/
 
 - **Model weights & architecture:** Thinking Machines Lab — [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (Apache-2.0)
 - **Inference engine & `.loom` programs:** AMD — [`ROCm/hrx-system`](https://github.com/ROCm/hrx-system) (`hrx-loom 0.3.0`) and [`loom-fun/unsloth-Inkling-2-Mini-loom`](https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom) (Apache-2.0)
+- The native image encoder, image component and mixed-input embedding code are adapted from the [Loom port at revision `53127fe`](https://huggingface.co/loom-fun/unsloth-Inkling-2-Mini-loom/tree/53127fe1faac17eba76e1de3d608d41fbbadde99/program) (Apache-2.0). Setup builds their weights from the official Thinking Machines checkpoint.

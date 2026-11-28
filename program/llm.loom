@@ -31124,7 +31124,7 @@ kernel.def export("g_embed") @g_embed(%tokens: index) {
   %c1 = index.constant 1 : index
   %c256 = index.constant 256 : index
   kernel.launch.config workgroups(%tokens, %c1, %c1) workgroup_size(%c256, %c1, %c1) : index
-} launch(%tokens_arg: index, %ids: buffer, %table: buffer, %w: buffer, %x: buffer, %h: buffer) {
+} launch(%tokens_arg: index, %ids: buffer, %meta: buffer, %tinfo: buffer, %table: buffer, %w: buffer, %x: buffer, %h: buffer) {
   %tokens = index.assume %tokens_arg [range(%tokens_arg, 1, 8192)] : index
   %token_id = kernel.workgroup.id<x> : index
   %token = index.assume %token_id [lt(%token_id, %tokens)] : index
@@ -31136,7 +31136,34 @@ kernel.def export("g_embed") @g_embed(%tokens: index) {
   %groups = index.constant 72 : index
   %zero_f = scalar.constant 0.0 : f32
   %ids_view = buffer.view %ids[%zero] : buffer -> view<[%tokens]xi32>
-  %raw = view.load %ids_view[%token] : view<[%tokens]xi32> -> i32
+  %meta_view = buffer.view %meta[%zero] : buffer -> view<4xi32>
+  %mixed_word = view.load %meta_view[2] : view<4xi32> -> i32
+  %mixed_zero = scalar.constant 0 : i32
+  %mixed = scalar.cmpi ne, %mixed_word, %mixed_zero : i32
+  %stride_one = index.constant 1 : index
+  %stride_eight = index.constant 8 : index
+  %id_stride = scf.select %mixed, %stride_eight, %stride_one : index
+  %n_ids = index.mul %tokens, %id_stride : index
+  %ids_flat = buffer.view %ids[%zero] : buffer -> view<[%n_ids]xi32>
+  %raw_e0 = index.mul %token, %id_stride : index
+  %raw_e = index.assume %raw_e0 [lt(%raw_e0, %n_ids)] : index
+  %raw = view.load %ids_flat[%raw_e] : view<[%n_ids]xi32> -> i32
+  %feat_word = scf.if %mixed -> (i32) {
+    %fw_e0 = index.mul %token, %id_stride : index
+    %fw_e1 = index.add %fw_e0, %stride_one : index
+    %fw_e = index.assume %fw_e1 [lt(%fw_e1, %n_ids)] : index
+    %fw = view.load %ids_flat[%fw_e] : view<[%n_ids]xi32> -> i32
+    scf.yield %fw : i32
+  } else {
+    scf.yield %mixed_zero : i32
+  }
+  // padding tokens of the epoch shape read stale records: only live inputs carry features
+  %tinfo_view = buffer.view %tinfo[%zero] : buffer -> view<[%tokens]x4xi32>
+  %live_word = view.load %tinfo_view[%token, 2] : view<[%tokens]x4xi32> -> i32
+  %is_live = scalar.cmpi ne, %live_word, %mixed_zero : i32
+  %has_feat = scalar.cmpi ne, %feat_word, %mixed_zero : i32
+  %is_feat = scalar.andi %has_feat, %is_live : i1
+  %feat_one_byte = index.constant 1 : offset
   %c0_i32 = scalar.constant 0 : i32
   %vocab_last = scalar.constant 200057 : i32
   %low = scalar.maxsi %raw, %c0_i32 : i32
@@ -31154,7 +31181,18 @@ kernel.def export("g_embed") @g_embed(%tokens: index) {
     %block_add = index.scale %block, %block_bytes : index, offset -> offset
     %origin = index.add %row_origin, %block_add : offset
     %v = func.call @g_q8_0_values(%table, %origin, %within) : (buffer, offset, index) -> (vector<32xf32>)
-    scf.yield %v : vector<32xf32>
+    %vv = scf.if %is_feat -> (vector<32xf32>) {
+      %fb_lane = index.assume %lane [range(%lane, 0, 71)] : index
+      %fo_u = scalar.maxsi %feat_word, %mixed_zero : i32
+      %fo_i = index.cast %fo_u : i32 to index
+      %fo = index.scale %fo_i, %feat_one_byte : index, offset -> offset
+      %fview = buffer.view %ids[%fo] : buffer -> view<72x32xf32>
+      %fv = vector.load %fview[%fb_lane, %c0] : view<72x32xf32> -> vector<32xf32>
+      scf.yield %fv : vector<32xf32>
+    } else {
+      scf.yield %v : vector<32xf32>
+    }
+    scf.yield %vv : vector<32xf32>
   } else {
     scf.yield %zero32 : vector<32xf32>
   }
@@ -31176,7 +31214,8 @@ kernel.def export("g_embed") @g_embed(%tokens: index) {
     vector.store %normalized, %x_view[%token, %bl, %c0] : vector<32xf32>, view<[%tokens]x72x32xf32>
     %weights = vector.load %w_view[%bl, %c0] : view<72x32xf32> -> vector<32xf32>
     %n2 = vector.mulf %normalized, %inverses2 : vector<32xf32>
-    %hv = vector.mulf %n2, %weights : vector<32xf32>
+    %hv0 = vector.mulf %n2, %weights : vector<32xf32>
+    %hv = scf.select %is_feat, %normalized, %hv0 : vector<32xf32>
     vector.store %hv, %h_view[%token, %bl, %c0] : vector<32xf32>, view<[%tokens]x72x32xf32>
   }
   kernel.return
@@ -67642,7 +67681,7 @@ command.def public target(@device) @llm_advance() launch(%weights: buffer, %feat
   // Embed + token_embd_norm -> %h, then copy %h -> %x so `cur` always lives in %x
   %embedding = command.parameter %weights, "token_embd.weight" : view<492106752xi8>
   %tok_norm = command.parameter %weights, "token_embd_norm.weight" : view<2304xf32>
-  kernel.launch @g_embed[%t](%t, %tokens, %embedding, %tok_norm, %x, %h) : [index](index, buffer, view<492106752xi8>, view<2304xf32>, buffer, buffer)
+  kernel.launch @g_embed[%t](%t, %tokens, %metadata, %info, %embedding, %tok_norm, %x, %h) : [index](index, buffer, buffer, buffer, view<492106752xi8>, view<2304xf32>, buffer, buffer)
   scf.if %gemm {
     kernel.launch @g_ink_copy_buf_lv[%t](%t, %h, %x, %info) : [index](index, buffer, buffer, buffer)
   } else {
@@ -87107,7 +87146,7 @@ command.def public target(@device) @llm_verify() launch(%weights: buffer, %featu
   // Embed + token_embd_norm -> %h, then copy %h -> %x so `cur` always lives in %x
   %embedding = command.parameter %weights, "token_embd.weight" : view<492106752xi8>
   %tok_norm = command.parameter %weights, "token_embd_norm.weight" : view<2304xf32>
-  kernel.launch @g_embed[%t](%t, %tokens, %embedding, %tok_norm, %x, %h) : [index](index, buffer, view<492106752xi8>, view<2304xf32>, buffer, buffer)
+  kernel.launch @g_embed[%t](%t, %tokens, %metadata, %info, %embedding, %tok_norm, %x, %h) : [index](index, buffer, buffer, buffer, view<492106752xi8>, view<2304xf32>, buffer, buffer)
   kernel.launch @g_ink_copy_buf[%t](%t, %h, %x) : [index](index, buffer, buffer)
   %loop_res_q = command.parameter %weights, "loop_res_query.weight" : view<221184xi8>
   %loop_kv_q = command.parameter %weights, "loop_kv_res_query.weight" : view<221184xi8>

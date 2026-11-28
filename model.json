@@ -17,17 +17,26 @@
     },
     "program/control.loom",
     "program/storage.loom",
-    "program/service.loom"
+    "program/service.loom",
+    "program/vision_prepare.loom",
+    "program/vision_control.loom"
    ],
    "libraries": [
-    "program/llm.loom"
+    "program/llm.loom",
+    "program/vision_stages.loom",
+    "program/vision_encoder.loom"
    ]
   }
  },
  "services": {
   "chat": {
    "kind": "text",
-   "version": 1
+   "version": 1,
+   "components": {
+    "image": {
+     "version": 1
+    }
+   }
   }
  },
  "variants": {
@@ -54,6 +63,14 @@
        "files": [
         {
          "path": "weights/dspark-Inkling-2-Mini-official-q8.gguf",
+         "format": "gguf"
+        }
+       ]
+      },
+      "vision": {
+       "files": [
+        {
+         "path": "weights/mmproj-Inkling-2-Mini-official-f16.gguf",
          "format": "gguf"
         }
        ]

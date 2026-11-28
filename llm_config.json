@@ -225,7 +225,8 @@
   "scopes": [
    "facet/drafted",
    "facet/moe",
-   "facet/sliding-window"
+   "facet/sliding-window",
+   "facet/vision"
   ],
   "choices": {},
   "devices": [
@@ -237,8 +238,16 @@
    "drafted",
    "gated-attn",
    "moe",
-   "sliding-window"
+   "sliding-window",
+   "vision"
   ],
   "env": {}
+ },
+ "vision": {
+  "mmproj": "mmproj-Inkling-2-Mini-official-f16.gguf",
+  "family": "inkling2v",
+  "img_begin": "<|content_image|>",
+  "img_end": "",
+  "end_states": "format"
  }
 }
