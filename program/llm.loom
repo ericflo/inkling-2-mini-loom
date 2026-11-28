@@ -31135,36 +31135,26 @@ kernel.def export("g_embed") @g_embed(%tokens: index) {
   %c8 = index.constant 1 : index
   %groups = index.constant 72 : index
   %zero_f = scalar.constant 0.0 : f32
-  %ids_view = buffer.view %ids[%zero] : buffer -> view<[%tokens]xi32>
-  %meta_view = buffer.view %meta[%zero] : buffer -> view<4xi32>
-  %mixed_word = view.load %meta_view[2] : view<4xi32> -> i32
-  %mixed_zero = scalar.constant 0 : i32
-  %mixed = scalar.cmpi ne, %mixed_word, %mixed_zero : i32
-  %stride_one = index.constant 1 : index
-  %stride_eight = index.constant 8 : index
-  %id_stride = scf.select %mixed, %stride_eight, %stride_one : index
-  %n_ids = index.mul %tokens, %id_stride : index
-  %ids_flat = buffer.view %ids[%zero] : buffer -> view<[%n_ids]xi32>
-  %raw_e0 = index.mul %token, %id_stride : index
-  %raw_e = index.assume %raw_e0 [lt(%raw_e0, %n_ids)] : index
-  %raw = view.load %ids_flat[%raw_e] : view<[%n_ids]xi32> -> i32
-  %feat_word = scf.if %mixed -> (i32) {
-    %fw_e0 = index.mul %token, %id_stride : index
-    %fw_e1 = index.add %fw_e0, %stride_one : index
-    %fw_e = index.assume %fw_e1 [lt(%fw_e1, %n_ids)] : index
-    %fw = view.load %ids_flat[%fw_e] : view<[%n_ids]xi32> -> i32
-    scf.yield %fw : i32
-  } else {
-    scf.yield %mixed_zero : i32
-  }
-  // padding tokens of the epoch shape read stale records: only live inputs carry features
-  %tinfo_view = buffer.view %tinfo[%zero] : buffer -> view<[%tokens]x4xi32>
-  %live_word = view.load %tinfo_view[%token, 2] : view<[%tokens]x4xi32> -> i32
-  %is_live = scalar.cmpi ne, %live_word, %mixed_zero : i32
-  %has_feat = scalar.cmpi ne, %feat_word, %mixed_zero : i32
-  %is_feat = scalar.andi %has_feat, %is_live : i1
-  %feat_one_byte = index.constant 1 : offset
   %c0_i32 = scalar.constant 0 : i32
+  %header = buffer.view %meta[%zero] : buffer -> view<4xi32>
+  %mixed_word = view.load %header[2] : view<4xi32> -> i32
+  %mixed = scalar.cmpi ne, %mixed_word, %c0_i32 : i32
+  %raw, %feature = scf.if %mixed -> (i32, i32) {
+    %packet = buffer.view %ids[%zero] : buffer -> view<[%tokens]x8xi32>
+    %id = view.load %packet[%token, 0] : view<[%tokens]x8xi32> -> i32
+    %offset = view.load %packet[%token, 1] : view<[%tokens]x8xi32> -> i32
+    // Padding in a mixed epoch may contain an old feature offset.
+    %info = buffer.view %tinfo[%zero] : buffer -> view<[%tokens]x4xi32>
+    %live = view.load %info[%token, 2] : view<[%tokens]x4xi32> -> i32
+    %valid = scalar.cmpi ne, %live, %c0_i32 : i32
+    %row = scf.select %valid, %offset, %c0_i32 : i32
+    scf.yield %id, %row : i32, i32
+  } else {
+    %ids_view = buffer.view %ids[%zero] : buffer -> view<[%tokens]xi32>
+    %id = view.load %ids_view[%token] : view<[%tokens]xi32> -> i32
+    scf.yield %id, %c0_i32 : i32, i32
+  }
+  %is_feat = scalar.cmpi ne, %feature, %c0_i32 : i32
   %vocab_last = scalar.constant 200057 : i32
   %low = scalar.maxsi %raw, %c0_i32 : i32
   %clamped = scalar.minsi %low, %vocab_last : i32
@@ -31176,20 +31166,20 @@ kernel.def export("g_embed") @g_embed(%tokens: index) {
   %active = index.cmp ult, %lane, %groups : index
   %zero32 = vector.splatf 0.0 : vector<32xf32>
   %values = scf.if %active -> (vector<32xf32>) {
-    %block = index.div %lane, %c8 : index
-    %within = index.rem %lane, %c8 : index
-    %block_add = index.scale %block, %block_bytes : index, offset -> offset
-    %origin = index.add %row_origin, %block_add : offset
-    %v = func.call @g_q8_0_values(%table, %origin, %within) : (buffer, offset, index) -> (vector<32xf32>)
     %vv = scf.if %is_feat -> (vector<32xf32>) {
-      %fb_lane = index.assume %lane [range(%lane, 0, 71)] : index
-      %fo_u = scalar.maxsi %feat_word, %mixed_zero : i32
-      %fo_i = index.cast %fo_u : i32 to index
-      %fo = index.scale %fo_i, %feat_one_byte : index, offset -> offset
-      %fview = buffer.view %ids[%fo] : buffer -> view<72x32xf32>
-      %fv = vector.load %fview[%fb_lane, %c0] : view<72x32xf32> -> vector<32xf32>
-      scf.yield %fv : vector<32xf32>
+      %bl = index.assume %lane [range(%lane, 0, 71)] : index
+      %fb = scalar.assume %feature [range(%feature, 1, 2147483647)] : i32
+      %fo64 = scalar.extui %fb : i32 to i64
+      %fo = index.cast %fo64 : i64 to offset
+      %row = buffer.view %ids[%fo] : buffer -> view<72x32xf32>
+      %v = vector.load %row[%bl, %c0] : view<72x32xf32> -> vector<32xf32>
+      scf.yield %v : vector<32xf32>
     } else {
+      %block = index.div %lane, %c8 : index
+      %within = index.rem %lane, %c8 : index
+      %block_add = index.scale %block, %block_bytes : index, offset -> offset
+      %origin = index.add %row_origin, %block_add : offset
+      %v = func.call @g_q8_0_values(%table, %origin, %within) : (buffer, offset, index) -> (vector<32xf32>)
       scf.yield %v : vector<32xf32>
     }
     scf.yield %vv : vector<32xf32>

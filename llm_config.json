@@ -149,7 +149,7 @@
   "content_call_separator": "",
   "call_separator": "",
   "call_marker": "<|content_invoke_tool_json|>",
-  "_note": "Inkling-2-Mini chat format: control.loom renders the whole conversation in chat_begin (chat/inkling2.loom); generic fields are informational and configure chat_reasoning, nonspecial_tokens, and terminal."
+  "_note": "control.loom renders the text prefix in chat_begin and uses the ordered content parts and frame dimensions for messages from the first image onward. The generic fields configure chat_reasoning, nonspecial_tokens, and terminal."
  },
  "attn_sinks": false,
  "kv_layers": 48,
