@@ -24,7 +24,7 @@ fi
 
 echo "==> [2/3] Downloading official thinkingmachines/Inkling-2-Mini weights ..."
 mkdir -p models/Inkling-2-Mini .hf_cache weights
-if [[ ! -f "models/Inkling-2-Mini/model-00001-of-00001.safetensors" || ! -f "models/Inkling-2-Mini/mtp.safetensors" ]]; then
+if [[ ! -f "models/Inkling-2-Mini/model-00001-of-00001.safetensors" || ! -f "models/Inkling-2-Mini/mtp.safetensors" || ! -f "models/Inkling-2-Mini/tokenizer.json" ]]; then
   HF_HOME="$SCRIPT_DIR/.hf_cache" \
   HF_XET_HIGH_PERFORMANCE=1 \
   .venv/bin/python -c "
@@ -38,19 +38,8 @@ else
   echo "    Official safetensors already present in models/Inkling-2-Mini/ (skipping download)."
 fi
 
-echo "==> [3/3] Converting official safetensors -> Loom GGUFs (NVFP4 + Q8_0 + DSpark) & tokenizer ..."
-if [[ ! -f "weights/Inkling-2-Mini-official-nvfp4-q8.gguf" || ! -f "weights/dspark-Inkling-2-Mini-official-q8.gguf" ]]; then
-  .venv/bin/python scripts/convert_official.py \
-    --model-dir models/Inkling-2-Mini \
-    --out-dir weights
-elif [[ ! -f "weights/tokenizer.json" ]]; then
-  .venv/bin/python scripts/convert_official.py \
-    --model-dir models/Inkling-2-Mini \
-    --out-dir weights \
-    --tokenizer-only
-else
-  echo "    Converted GGUFs and tokenizer already present in weights/ (delete them to reconvert)."
-fi
+echo "==> [3/3] Converting missing text, DSpark and vision GGUFs and tokenizer ..."
+.venv/bin/python scripts/convert_official.py --only-missing
 
 echo ""
 echo "Setup complete! Start the server with:"

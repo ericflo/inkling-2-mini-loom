@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Convert official thinkingmachines/Inkling-2-Mini safetensors directly into
-AMD Loom-compatible GGUF files (main model + DSpark MTP drafter) with ZERO Q4
+AMD Loom-compatible GGUF files (main model, DSpark MTP drafter and vision encoder) with ZERO Q4
 downgrade:
 
   - Layers 0-19 routed MoE experts:  bit-exact native NVFP4 (repacked from
@@ -16,6 +16,8 @@ downgrade:
     attention-residual queries:      F32   (exact)
   - DSpark MTP drafter:              BF16  -> Q8_0 (3 layers) + BF16 (Markov
     head) + F32 (norms/biases/fuse/mask)
+  - Vision encoder and projector:    BF16  -> F16 matrices + F32 positions,
+    normalization, layer scales and biases
 
 Requires only Python stdlib + numpy. No PyTorch, no third-party weight files.
 """
@@ -27,6 +29,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +39,7 @@ import numpy as np
 
 # GGML quantization type IDs (GGUF v3)
 GGML_TYPE_F32 = 0
+GGML_TYPE_F16 = 1
 GGML_TYPE_Q8_0 = 8
 GGML_TYPE_BF16 = 30
 GGML_TYPE_NVFP4 = 40
@@ -305,7 +309,7 @@ def _gguf_byte_size(shape_rowmajor: tuple[int, ...], ggml_type: int) -> int:
         ne *= d
     if ggml_type == GGML_TYPE_F32:
         return ne * 4
-    if ggml_type == GGML_TYPE_BF16:
+    if ggml_type in (GGML_TYPE_F16, GGML_TYPE_BF16):
         return ne * 2
     if ggml_type == GGML_TYPE_Q8_0:
         assert shape_rowmajor[-1] % 32 == 0
@@ -340,7 +344,6 @@ def write_gguf(
 ) -> None:
     """Stream-write a valid GGUF v3 file with 32-byte aligned tensor payloads."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
 
     # Compute relative data offsets (32-byte aligned)
     offsets: list[int] = []
@@ -382,7 +385,11 @@ def write_gguf(
 
     t0 = time.monotonic()
     written_data = 0
-    with open(tmp_path, "wb") as fp:
+    # Simultaneous setup/first launches must never share a partial output.
+    with (
+        tempfile.TemporaryDirectory(dir=out_path.parent) as directory,
+        (Path(directory) / out_path.name).open("wb") as fp,
+    ):
         fp.write(hdr)
         for idx, (t, off) in enumerate(zip(tensors, offsets)):
             cur_pos = fp.tell() - data_start
@@ -409,7 +416,8 @@ def write_gguf(
                     flush=True,
                 )
 
-    os.replace(tmp_path, out_path)
+        fp.flush()
+        os.replace(fp.name, out_path)
     final_sz = out_path.stat().st_size
     print(
         f"Wrote {out_path} ({final_sz / (1024**3):.2f} GiB, {len(tensors)} tensors) "
@@ -640,6 +648,56 @@ def build_main_specs(reader: SafetensorsReader) -> list[TensorSpec]:
     return specs
 
 
+def build_vision_specs(reader: SafetensorsReader) -> list[TensorSpec]:
+    """Map the official visual tower to the tensors consumed by vision_encode."""
+    specs: list[TensorSpec] = []
+
+    def add(source: str, name: str, ggml_type: int) -> None:
+        key = "model.visual." + source
+        shape = reader.shape(key)
+        is_patch = name == "v.patch_embd.weight"
+        if is_patch:
+            # The checkpoint flattens each 20x20 RGB patch in HWC order.
+            shape = (shape[0], 3, 20, 20)
+
+        def write() -> Iterable[bytes]:
+            values = reader.read_f32(key)
+            if is_patch:
+                values = values.reshape(-1, 20, 20, 3).transpose(0, 3, 1, 2)
+            dtype = "<f2" if ggml_type == GGML_TYPE_F16 else "<f4"
+            yield np.ascontiguousarray(values, dtype=dtype).tobytes()
+
+        specs.append(TensorSpec(name, shape, ggml_type, write))
+
+    for source, name in (
+        ("class_embedding", "class_embd"),
+        ("cls_position_embedding", "class_position_embd.weight"),
+        ("position_embedding", "position_embd.weight"),
+    ):
+        add("backbone.embeddings." + source, "v." + name, GGML_TYPE_F32)
+    add("backbone.embeddings.patch_embedding.weight", "v.patch_embd.weight", GGML_TYPE_F16)
+    for suffix in ("weight", "bias"):
+        add("backbone.ln_pre." + suffix, "v.pre_ln." + suffix, GGML_TYPE_F32)
+
+    for i in range(23):
+        source = f"backbone.layers.{i}."
+        dest = f"v.blk.{i}."
+        for n in (1, 2):
+            add(source + f"ls_{n}.gamma", dest + f"ls{n}.weight", GGML_TYPE_F32)
+            for suffix in ("weight", "bias"):
+                add(source + f"ln_{n}.{suffix}", dest + f"ln{n}.{suffix}", GGML_TYPE_F32)
+        for layer, name in (
+            ("self_attn.q_proj", "attn_q"), ("self_attn.k_proj", "attn_k"),
+            ("self_attn.v_proj", "attn_v"), ("self_attn.out_proj", "attn_out"),
+            ("mlp.c_fc", "ffn_up"), ("mlp.c_proj", "ffn_down"),
+        ):
+            add(source + layer + ".weight", dest + name + ".weight", GGML_TYPE_F16)
+            add(source + layer + ".bias", dest + name + ".bias", GGML_TYPE_F32)
+    add("proj_in.weight", "mm.1.weight", GGML_TYPE_F16)
+    add("proj_out.weight", "mm.2.weight", GGML_TYPE_F16)
+    return specs
+
+
 def build_dspark_specs(reader: SafetensorsReader) -> list[TensorSpec]:
     specs: list[TensorSpec] = []
 
@@ -769,6 +827,8 @@ def main() -> int:
     )
     ap.add_argument("--skip-main", action="store_true", help="Skip main model conversion")
     ap.add_argument("--skip-draft", action="store_true", help="Skip DSpark drafter conversion")
+    ap.add_argument("--skip-vision", action="store_true", help="Skip vision encoder and projector conversion")
+    ap.add_argument("--only-missing", action="store_true", help="Reuse existing GGUFs and tokenizer")
     ap.add_argument("--tokenizer-only", action="store_true", help="Only generate Loom-patched tokenizer.json")
     ap.add_argument("--llm-config", type=Path, default=Path("llm_config.json"), help="Path to llm_config.json")
     ap.add_argument("--verify-only", action="store_true", help="Run NVFP4 bit-exact round-trip self-test only")
@@ -782,20 +842,22 @@ def main() -> int:
 
     model_st = args.model_dir / "model-00001-of-00001.safetensors"
     mtp_st = args.model_dir / "mtp.safetensors"
+    out_main = args.out_dir / "Inkling-2-Mini-official-nvfp4-q8.gguf"
+    out_draft = args.out_dir / "dspark-Inkling-2-Mini-official-q8.gguf"
+    out_vision = args.out_dir / "mmproj-Inkling-2-Mini-official-f16.gguf"
 
-    if not model_st.is_file():
-        print(f"ERROR: missing {model_st}", file=sys.stderr)
-        return 1
+    def needed(path: Path) -> bool:
+        return not (args.only_missing and path.is_file())
 
-    verify_nvfp4_roundtrip(model_st)
     if args.verify_only:
+        verify_nvfp4_roundtrip(model_st)
         return 0
 
-    if src_tok.is_file() and args.llm_config.is_file():
+    if needed(dst_tok) and src_tok.is_file() and args.llm_config.is_file():
         patch_tokenizer_for_loom(src_tok, dst_tok, args.llm_config)
 
-    if not args.skip_main:
-        out_main = args.out_dir / "Inkling-2-Mini-official-nvfp4-q8.gguf"
+    if not args.skip_main and needed(out_main):
+        verify_nvfp4_roundtrip(model_st)
         print(f"\nConverting main model: {model_st} -> {out_main}")
         with SafetensorsReader(model_st) as r:
             specs = build_main_specs(r)
@@ -807,11 +869,10 @@ def main() -> int:
             ]
             write_gguf(out_main, meta, specs)
 
-    if not args.skip_draft:
+    if not args.skip_draft and needed(out_draft):
         if not mtp_st.is_file():
             print(f"ERROR: missing {mtp_st}", file=sys.stderr)
             return 1
-        out_draft = args.out_dir / "dspark-Inkling-2-Mini-official-q8.gguf"
         print(f"\nConverting DSpark drafter: {mtp_st} -> {out_draft}")
         with SafetensorsReader(mtp_st) as r:
             specs = build_dspark_specs(r)
@@ -822,6 +883,17 @@ def main() -> int:
                 ("general.quantization_version", GGUF_TYPE_UINT32, 2),
             ]
             write_gguf(out_draft, meta, specs)
+
+    if not args.skip_vision and needed(out_vision):
+        print(f"\nConverting vision encoder and projector: {model_st} -> {out_vision}")
+        with SafetensorsReader(model_st) as reader:
+            meta = [
+                ("general.architecture", GGUF_TYPE_STRING, "clip"),
+                ("general.name", GGUF_TYPE_STRING, "Inkling-2-Mini (official vision F16 + F32)"),
+                ("general.alignment", GGUF_TYPE_UINT32, GGUF_ALIGNMENT),
+                ("clip.vision.projector_type", GGUF_TYPE_STRING, "inkling2v"),
+            ]
+            write_gguf(out_vision, meta, build_vision_specs(reader))
 
     print("\nAll conversions complete!")
     return 0
@@ -852,8 +924,11 @@ def patch_tokenizer_for_loom(src_tokenizer: Path, dst_tokenizer: Path, llm_confi
             entry["special"] = True
 
     dst_tokenizer.parent.mkdir(parents=True, exist_ok=True)
-    with open(dst_tokenizer, "w", encoding="utf-8") as f:
-        json.dump(tok, f, ensure_ascii=False, separators=(",", ":"))
+    with tempfile.TemporaryDirectory(dir=dst_tokenizer.parent) as directory:
+        tmp = Path(directory) / dst_tokenizer.name
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(tok, f, ensure_ascii=False, separators=(",", ":"))
+        tmp.replace(dst_tokenizer)
     print(f"Wrote {dst_tokenizer} (marked {patched} structural channel tokens non-special for Loom)")
 
 
