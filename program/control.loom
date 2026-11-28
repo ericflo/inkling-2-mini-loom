@@ -53,8 +53,8 @@ global.rodata.def @effort_none = bytes("6e6f6e65")
 
 global.rodata.def @newline = bytes("0a")
 
-// "unsupported message: roles are system/user/assistant/tool, content is text (no images)"
-global.rodata.def @invalid = bytes("756e737570706f72746564206d6573736167653a20726f6c6573206172652073797374656d2f757365722f617373697374616e742f746f6f6c2c20636f6e74656e74206973207465787420286e6f20696d6167657329")
+// "Unsupported chat message. Use system, user, assistant or tool roles and put image_url parts in user or tool messages."
+global.rodata.def @invalid = bytes("556e737570706f727465642063686174206d6573736167652e205573652073797374656d2c20757365722c20617373697374616e74206f7220746f6f6c20726f6c657320616e642070757420696d6167655f75726c20706172747320696e2075736572206f7220746f6f6c206d657373616765732e")
 
 // "llm requires pooled epochs without MTP"
 global.rodata.def @unsupported = bytes("6c6c6d20726571756972657320706f6f6c65642065706f63687320776974686f7574204d5450")

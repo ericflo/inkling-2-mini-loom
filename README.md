@@ -14,7 +14,7 @@ Fastest local inference setup for Thinking Machines Lab's **[`thinkingmachines/I
 ## Requirements
 
 - **Hardware:** AMD Strix Halo (`gfx1151` / Radeon 8060S) or supported RDNA3/RDNA4 Linux GPU with `/dev/kfd` and `/dev/dri` access
-- **Memory:** ≥64 GB unified RAM/VRAM (~30.5 GiB fixed pool at 262k context; use `CONTEXT_CAPACITY=131072` or `POOL_BACKING=elastic` for tighter footprints)
+- **Memory:** ≥64 GB unified RAM/VRAM (about 31 GiB of fixed storage at 262k context, plus workspace for the active requests)
 - **Disk:** ~40 GB free (~19 GB official safetensors + ~17 GB converted Loom GGUFs; once converted, `models/` can optionally be deleted if you don't need to reconvert)
 - **Software:** Linux, Python 3.12+ (`uv` optional, auto-detected by `setup.sh`)
 
@@ -32,9 +32,12 @@ cd inkling-2-mini-loom
 After the one-time `./setup.sh` step, just run `./run.sh` to start the server. It compiles/loads on `AMD Radeon 8060S (gfx1151)` in ~18 seconds and serves:
 
 - **OpenAI Chat API:** `http://127.0.0.1:18422/v1/chat/completions`
+- **Model discovery:** `http://127.0.0.1:18422/v1/models` reports `["text", "image"]` as input modalities and `["text"]` as output.
 - **Live Dashboard:** `http://127.0.0.1:18422/dashboard/`
 - **Readiness / Status:** `http://127.0.0.1:18422/v1/status`
 - **Prometheus Metrics:** `http://127.0.0.1:18422/metrics`
+
+On an existing installation, `./run.sh` builds the 610 MiB vision GGUF on first launch from the cached official safetensors. If you previously removed `models/`, run `./setup.sh` once to restore the source. Setup reuses the existing text and DSpark GGUFs.
 
 ---
 
@@ -55,7 +58,7 @@ DRAFT_DEPTH=0 ./run.sh
 # Reduce KV pool size (e.g., 131k tokens on a 64 GB Strix Halo)
 CONTEXT_CAPACITY=131072 ./run.sh
 
-# Use demand-committed elastic memory instead of fixed eager allocation (~30.5 GB fixed)
+# Use demand-committed elastic memory
 POOL_BACKING=elastic ./run.sh
 ```
 
@@ -75,18 +78,40 @@ POOL_BACKING=elastic ./run.sh
 
 ## API Examples
 
+The default launch registers `inkling-2-mini-loom`. When overriding `ROWS`, `DRAFT_DEPTH`, or `CONTEXT_CAPACITY`, use the deployment ID returned by `/v1/models`.
+
 ### Standard chat (recommended sampling: `temperature=1.0`, `top_p=1.0`)
 
 ```bash
 curl http://127.0.0.1:18422/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "Inkling-2-Mini",
+    "model": "inkling-2-mini-loom",
     "messages": [{"role": "user", "content": "Explain how looped transformers work in 3 crisp bullet points."}],
     "temperature": 1.0,
     "top_p": 1.0
   }'
 ```
+
+### Ask about an image
+
+Replace `photo.jpg` with a local JPEG. The client sends its bytes as a base64 data URL. You can interleave text and up to four images in one request. The server accepts static images up to 4096 pixels per side, subject to its HTTP body limit (8 MiB by default).
+
+```bash
+python3 - photo.jpg <<'PY' | curl -sS http://127.0.0.1:18422/v1/chat/completions \
+  -H 'Content-Type: application/json' --data-binary @-
+import base64, json, pathlib, sys
+
+image = base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode("ascii")
+parts = [
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image}},
+    {"type": "text", "text": "Describe what you see in this photo."},
+]
+print(json.dumps({"model": "inkling-2-mini-loom", "messages": [{"role": "user", "content": parts}]}))
+PY
+```
+
+Loom runs the vision encoder on the GPU during image prefill and feeds its projected rows directly to the language model. Text and image replies then use the same decoder and DSpark settings. Time to first token includes image decoding, projection, and the additional prompt positions. The first request for a new processed image size can also include kernel compilation.
 
 ### Control thinking / reasoning effort
 
@@ -96,7 +121,7 @@ Inkling-2-Mini supports `reasoning_effort`: `"none"`, `"minimal"`, `"low"`, `"me
 curl http://127.0.0.1:18422/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "Inkling-2-Mini",
+    "model": "inkling-2-mini-loom",
     "messages": [{"role": "user", "content": "What is 17 * 23 + 11?"}],
     "reasoning_effort": "low"
   }'
@@ -108,7 +133,7 @@ curl http://127.0.0.1:18422/v1/chat/completions \
 curl http://127.0.0.1:18422/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "Inkling-2-Mini",
+    "model": "inkling-2-mini-loom",
     "messages": [{"role": "user", "content": "What is the weather in Seattle?"}],
     "tools": [{
       "type": "function",
@@ -157,6 +182,24 @@ Run the verification and benchmark suite yourself against a running server:
 .venv/bin/python scripts/verify_and_bench.py --url http://127.0.0.1:18422
 ```
 
+### Text and image generation speed
+
+On the Radeon 8060S, the default preset produced the following warm medians over six requests per case. Each request used the same counting prompt, greedy sampling, adaptive DSpark and a 192-token output. The comparison rotated through all six orderings of the three cases. Every request reported zero cached prompt tokens.
+
+| Input | Prompt tokens | Time to first streamed token | Decode |
+|---|---:|---:|---:|
+| Text on the original revision `2b2e7aa` | 35 | 213 ms | 74.6 tok/s |
+| Text | 35 | 209 ms | 77.4 tok/s |
+| Text and a 160×120 PNG | 50 | 235 ms | 77.3 tok/s |
+
+In a separate five-run comparison, a **640×480 PNG** brought the prompt to 230 tokens. Median time to first token was **755 ms** with the image and **204 ms** with text alone. Decode measured **76.6** and **78.5 tok/s**, respectively.
+
+To check the advertised modalities, verify the answers to pixel-dependent questions, and measure current throughput at two image sizes, run the following against a running server.
+
+```bash
+.venv/bin/python scripts/verify_and_bench.py --vision-only
+```
+
 ---
 
 ## Weight Precision Breakdown
@@ -175,9 +218,9 @@ Run the verification and benchmark suite yourself against a running server:
 | DSpark MTP drafter (3 layers) | `BF16` (`mtp.safetensors`) | **`Q8_0`** | **`Q8_0`** | `dspark-Inkling-2-Mini-official-q8.gguf` (`0.36 GiB`) |
 | DSpark Markov head (`markov_w1`, `joint_proj`, `hidden_out`) | `BF16` | **`BF16`** | **`BF16`** | Exact raw `BF16` copy; `fuse_weight`/`mask_embd`/norms in `F32` |
 | DSpark *proposal-only* LM head (`%w_phead`) | Derived from `output.weight` | — | `Q4_0s` | Built at load by `head_weights.loom` **only** for draft proposals; never alters verified output |
+| Image encoder and projector | `BF16` | `F16` matrices, `F32` positions, norms, scales and biases | `F16` / `F32` | 23 vision transformer blocks and a 2304-wide projection into the language model |
 
-Total converted weight footprint: **16.41 GiB** (main) + **0.36 GiB** (DSpark drafter) = **16.77 GiB**.
-Total fixed GPU/unified memory pool at 262k context: **~30.5 GiB** (fits comfortably in 64 GB or 128 GB Strix Halo).
+The converted weights occupy **17.37 GiB** in total, including **16.41 GiB** for the language model, **0.36 GiB** for DSpark and **0.60 GiB** for vision. Loom reports **30.89 GiB** of committed fixed storage at 262k context with both components active. Workspace depends on the request.
 
 ---
 
@@ -197,10 +240,11 @@ inkling-2-mini-loom/
 │   ├── llm.loom              # gfx1151 NVFP4 / Q8_0 / WMMA / DSpark compute kernels
 │   ├── prepare.loom          # Stage & execution shape planner
 │   ├── service.loom          # OpenAI text service ABI
-│   └── storage.loom          # Paged KV + SWA ring + short-conv state arena layout
+│   ├── storage.loom          # Paged KV + SWA ring + short-conv state arena layout
+│   └── vision_*.loom         # Image component, preprocessing, ViT and projector
 ├── scripts/
 │   ├── convert_official.py   # Pure-NumPy official safetensors -> Loom GGUF & tokenizer converter
-│   └── verify_and_bench.py   # Coherence, tool-calling, DSpark acceptance & throughput benchmarks
+│   └── verify_and_bench.py   # Image grounding, chat features, DSpark and throughput checks
 ├── models/                   # (.gitignored) Official thinkingmachines/Inkling-2-Mini download (~19 GB)
 ├── weights/                  # (.gitignored) Converted NVFP4+Q8_0 GGUFs & Loom tokenizer (~17 GB)
 ├── .hf_cache/                # (.gitignored) Hugging Face download cache

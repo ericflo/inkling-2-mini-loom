@@ -7,11 +7,15 @@ Inkling-2-Mini on AMD Loom (Strix Halo gfx1151).
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import json
 import re
-import sys
+import statistics
+import struct
 import time
+import zlib
+from functools import partial
 from typing import Any
 
 import requests
@@ -61,7 +65,7 @@ def stream_chat(
     base_url: str,
     messages: list[dict[str, Any]],
     *,
-    model: str = "Inkling-2-Mini",
+    model: str = "inkling-2-mini-loom",
     max_tokens: int = 256,
     temperature: float | None = 1.0,
     top_p: float | None = 1.0,
@@ -104,6 +108,7 @@ def stream_chat(
         timeout=300,
     ) as resp:
         resp.raise_for_status()
+        resp.encoding = "utf-8"
         for raw in resp.iter_lines(decode_unicode=True):
             if not raw or not raw.startswith("data:"):
                 continue
@@ -189,20 +194,103 @@ def extract_draft_stats(m_before: dict[str, float], m_after: dict[str, float]) -
     return ", ".join(parts) if parts else "draft=n/a"
 
 
+def image_part(left: bytes, right: bytes, width: int = 160, height: int = 120) -> dict:
+    """Create an RGB PNG in memory so the server has to answer from pixels."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    row = left * (width // 2) + right * (width - width // 2)
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    pixels = zlib.compress((b"\0" + row) * height)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
+    url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def verify_vision(base_url: str, model: str, repeats: int) -> None:
+    discovery = requests.get(f"{base_url}/v1/models", timeout=5)
+    discovery.raise_for_status()
+    card = next(m for m in discovery.json()["data"] if m["id"] == model)
+    for metadata in (card, card["architecture"]):
+        if not {"text", "image"}.issubset(metadata["input_modalities"]):
+            raise AssertionError(f"{model} advertised {metadata['input_modalities']} for input")
+    chat = partial(stream_chat, base_url, model=model, temperature=0.0)
+    red, blue = bytes([255, 0, 0]), bytes([0, 0, 255])
+    question = {"type": "text", "text": "What color is the left half of the image? Answer with one color name."}
+    counts = []
+    for width in (160, 200):
+        parts = [image_part(red, blue, width=width), question]
+        counted = requests.post(
+            f"{base_url}/v1/chat/completions/input_tokens",
+            json={"model": model, "messages": [{"role": "user", "content": parts}]},
+            timeout=30,
+        )
+        counted.raise_for_status()
+        counts.append(counted.json()["input_tokens"])
+    if counts[1] - counts[0] != 3:
+        raise AssertionError(f"One extra 40-pixel column at height 120 should add 3 image tokens, got {counts}")
+
+    for left, right, expected in [(red, blue, "red"), (blue, red, "blue")]:
+        parts = [image_part(left, right), question]
+        answer = chat([{"role": "user", "content": parts}], max_tokens=384)["content"]
+        if re.findall(r"\b(?:red|blue)\b", answer.lower()) != [expected]:
+            raise AssertionError(f"Expected {expected} on the left, got {answer!r}")
+
+    parts = [
+        image_part(blue, blue), image_part(red, red),
+        {"type": "text", "text": "Name the solid color in each image, in order. Answer with two colors."},
+    ]
+    answer = chat([{"role": "user", "content": parts}], max_tokens=384)["content"]
+    if re.findall(r"\b(?:red|blue)\b", answer.lower()) != ["blue", "red"]:
+        raise AssertionError(f"Expected blue then red, got {answer!r}")
+    print(f"{model} advertises image input and passed the pixel and image-order checks.", flush=True)
+
+    prompt = "List the integers from 1 to 200 in order, separated by commas. Begin with 1."
+    text_part = {"type": "text", "text": prompt}
+    inputs = {
+        "text": prompt,
+        "160×120": [image_part(blue, blue), text_part],
+        "640×480": [image_part(blue, blue, 640, 480), text_part],
+    }
+    modes = list(inputs)
+    results = {mode: [] for mode in modes}
+    # Warm every shape, then rotate the order to spread clock/thermal variation.
+    for i in range(repeats + 1):
+        start = i % len(modes)
+        for mode in modes[start:] + modes[:start]:
+            res = chat([{"role": "user", "content": inputs[mode]}], max_tokens=192)
+            if res["completion_tokens"] != 192:
+                raise AssertionError(f"{mode} benchmark ended at {res['completion_tokens']} tokens")
+            if i:
+                results[mode].append(res)
+    print(f"Warm medians over {repeats} single-stream requests per input, 192 generated tokens")
+    for mode, runs in results.items():
+        ttft = 1000 * statistics.median(r["ttft_s"] for r in runs)
+        decode = statistics.median(r["decode_tps"] for r in runs)
+        print(f"  {mode:5s} | prompt={runs[0]['prompt_tokens']} | TTFT={ttft:.1f} ms | decode={decode:.1f} tok/s")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:18422")
     ap.add_argument("--quick", action="store_true", help="Skip 8k prefill and 4-stream tests")
+    ap.add_argument("--vision-only", action="store_true", help="Run image checks and the paired text/image benchmark")
     args = ap.parse_args()
 
     print(f"Waiting for server at {args.url} ...")
-    wait_ready(args.url)
+    status = wait_ready(args.url)
+    model = (status.get("data") or status["models"])[0]["id"]
+    chat = partial(stream_chat, args.url, model=model)
     print("Server READY!\n")
+
+    verify_vision(args.url, model, repeats=3 if args.quick else 5)
+    if args.vision_only:
+        return 0
 
     # 1. Sanity / Coherence checks
     print("=== 1. COHERENCE & FEATURE CHECKS ===")
-    r1 = stream_chat(
-        args.url,
+    r1 = chat(
         [{"role": "user", "content": "Explain in 2 crisp sentences why unified memory helps local MoE LLM inference."}],
         max_tokens=256,
         temperature=0.0,
@@ -213,8 +301,7 @@ def main() -> int:
         print("  reasoning:", repr(r1["reasoning"][:120]))
     print("  content:  ", r1["content"].strip())
 
-    r2 = stream_chat(
-        args.url,
+    r2 = chat(
         [{"role": "user", "content": "What is 17 * 23 + 11? Give the final number clearly."}],
         max_tokens=384,
         temperature=1.0,
@@ -239,8 +326,7 @@ def main() -> int:
             },
         }
     ]
-    r_tool = stream_chat(
-        args.url,
+    r_tool = chat(
         [{"role": "user", "content": "What's the weather in Seattle right now?"}],
         max_tokens=160,
         temperature=0.0,
@@ -275,7 +361,7 @@ def main() -> int:
     ]
     for name, msgs, mtok, think in benches:
         mb = read_metrics(args.url)
-        res = stream_chat(args.url, msgs, max_tokens=mtok, temperature=1.0, enable_thinking=think)
+        res = chat(msgs, max_tokens=mtok, temperature=1.0, enable_thinking=think)
         ma = read_metrics(args.url)
         dstat = extract_draft_stats(mb, ma)
         print(
@@ -286,8 +372,7 @@ def main() -> int:
     # 2k context prefill + decode
     doc2k = make_filler_doc(2048)
     mb = read_metrics(args.url)
-    r2k = stream_chat(
-        args.url,
+    r2k = chat(
         [{"role": "user", "content": f"Read the following technical notes carefully and then summarize the key points in 150 words:\n\n{doc2k}"}],
         max_tokens=200,
         temperature=1.0,
@@ -301,8 +386,7 @@ def main() -> int:
 
     if not args.quick:
         doc8k = make_filler_doc(8192)
-        r8k = stream_chat(
-            args.url,
+        r8k = chat(
             [{"role": "user", "content": f"Summarize the main theme of this document in one sentence:\n\n{doc8k}"}],
             max_tokens=64,
             temperature=1.0,
@@ -322,8 +406,7 @@ def main() -> int:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
             futs = [
                 ex.submit(
-                    stream_chat,
-                    args.url,
+                    chat,
                     [{"role": "user", "content": p}],
                     max_tokens=200,
                     temperature=1.0,
